@@ -1,23 +1,19 @@
 import os
 import json
 import hashlib
+import asyncio
 import feedparser
-import google.generativeai as genai
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application
 from datetime import datetime, timezone
 import re
 import random
+from telegram import Bot
+from telegram.ext import Application
 
 # ========== الإعدادات ==========
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHANNEL = os.environ.get("CHANNEL")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyAj3swGk1X_9EYVjFC5pHMfCjZZR8YNF1s")
 
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-2.0-flash')
-
-# ========== المصادر ==========
+# ========== المصادر (28 مصدر) ==========
 SOURCES = {
     "الجزيرة": "https://www.aljazeera.net/xml/rss.xml",
     "BBC عربي": "https://feeds.bbci.co.uk/arabic/news/rss.xml",
@@ -46,131 +42,116 @@ SOURCES = {
     "الشرق الأوسط": "https://aawsat.com/feed",
     "البيان": "https://www.albayan.ae/rss/",
     "الشرق": "https://www.al-sharq.com/rss",
+    "الرأي": "https://www.alraimedia.com/rss",
 }
 
-# ========== قاعدة البيانات ==========
+# ========== قاعدة بيانات التكرار ==========
+DB_FILE = "news_db.json"
+
 def load_db():
     try:
-        with open("news_db.json", "r") as f:
-            return json.load(f)
+        with open(DB_FILE, "r", encoding="utf-8") as f:
+            c = f.read().strip()
+            return json.loads(c) if c else {"hashes": [], "ids": []}
     except:
-        return {"hashes": [], "urls": []}
+        return {"hashes": [], "ids": []}
 
 def save_db(db):
-    with open("news_db.json", "w") as f:
-        json.dump(db, f)
+    if len(db["hashes"]) > 3000:
+        db["hashes"] = db["hashes"][-3000:]
+        db["ids"] = db["ids"][-3000:]
+    with open(DB_FILE, "w", encoding="utf-8") as f:
+        json.dump(db, f, ensure_ascii=False)
 
-def is_duplicate(title, url, db):
-    h = hashlib.md5(title[:120].encode()).hexdigest()
-    if h in db["hashes"] or url in db["urls"]:
-        return True
+def is_new(news_id, db):
+    h = hashlib.md5(news_id.encode()).hexdigest()
+    if h in db["hashes"] or news_id in db["ids"]:
+        return False
     db["hashes"].append(h)
-    db["urls"].append(url)
-    if len(db["hashes"]) > 800:
-        db["hashes"] = db["hashes"][-800:]
-        db["urls"] = db["urls"][-800:]
-    return False
+    db["ids"].append(news_id)
+    return True
 
-# ========== تنظيف ==========
+# ========== تنظيف النص ==========
 def clean(txt):
     return re.sub(r'<[^>]+>', '', txt).strip()
 
-# ========== تحليل AI ==========
-def analyze(title, summary):
-    prompt = f"""حلل الخبر التالي وأجب بالصيغة التالية فقط:
+# ========== تصنيف الأهمية ==========
+URGENT_KEYWORDS = ["عاجل", "انفجار", "حرب", "قصف", "غارة", "هجوم", "زلزال", "إعصار", "اغتيال"]
+IMPORTANT_KEYWORDS = ["رئيس", "وزير", "انتخابات", "اقتصاد", "نفط", "دولار", "ذهب", "أسهم", "بورصة", "أمم", "قمة", "معاهدة", "استقالة"]
 
-السطر 1: تقييم الأهمية (رقم 1-10)
-السطر 2: ملخص (2-3 أسطر كحد أقصى)
-السطر 3: تحليل سريع (سطر أو سطرين)
-السطر 4: تصنيف واحد من (عاجل / مهم / عادي)
-
-العنوان: {title}
-الوصف: {summary[:400]}
-
-ابدأ:"""
-    try:
-        resp = model.generate_content(prompt)
-        lines = resp.text.strip().split('\n')
-        imp = 5; sm = summary[:180]; impa = ""; urg = "عادي"
-        for i, line in enumerate(lines):
-            line = line.strip()
-            if i == 0:
-                try: imp = int(re.search(r'\d+', line).group())
-                except: pass
-            elif i == 1 and line: sm = line
-            elif i == 2 and line: impa = line
-            elif i == 3:
-                if "عاجل" in line: urg = "عاجل"
-                elif "مهم" in line: urg = "مهم"
-        return imp, sm, impa, urg
-    except:
-        return 5, summary[:180], "", "عادي"
+def classify(title, summary):
+    text = f"{title} {summary}"
+    imp = 5
+    urg = "عادي"
+    for w in URGENT_KEYWORDS:
+        if w in text:
+            imp = 9
+            urg = "عاجل"
+            break
+    if urg != "عاجل":
+        for w in IMPORTANT_KEYWORDS:
+            if w in text:
+                imp = 7
+                urg = "مهم"
+                break
+    sm = summary[:200] + "..." if len(summary) > 200 else summary
+    return imp, sm, "", urg
 
 # ========== جلب الأخبار ==========
 def fetch_all():
     db = load_db()
     news_list = []
-
-    for source_name, url in SOURCES.items():
+    for src, url in SOURCES.items():
         try:
             feed = feedparser.parse(url)
-            for entry in feed.entries[:2]:
-                title = clean(entry.title)
-                link = entry.link
-                summary = clean(entry.summary[:300]) if hasattr(entry, "summary") else ""
-                
-                if not is_duplicate(title, link, db):
-                    news_list.append({
-                        "source": source_name,
-                        "title": title,
-                        "link": link,
-                        "summary": summary
-                    })
-        except Exception as e:
-            print(f"⚠️ {source_name}: {e}")
-
+            for e in feed.entries[:1]:
+                title = clean(e.title)
+                link = e.link
+                summary = clean(e.summary[:350]) if hasattr(e, "summary") else ""
+                news_id = f"{link}"
+                if is_new(news_id, db):
+                    news_list.append({"source": src, "title": title, "link": link, "summary": summary})
+        except Exception as ex:
+            print(f"⚠️ {src}: {ex}")
     save_db(db)
     return news_list
 
 # ========== تنسيق ==========
-def fmt(news, imp, sm, impact, urg):
-    flags = {"الجزيرة": "🇶🇦", "BBC عربي": "🇬🇧", "CNN": "🇺🇸", "روسيا اليوم": "🇷🇺",
-             "سكاي نيوز": "🇦🇪", "فرانس 24": "🇫🇷", "العربية": "🇸🇦", "الشرق للأخبار": "🇶🇦",
-             "الغد": "🇯🇴", "المصدر": "🇾🇪", "الخليج": "🇦🇪", "وكالة الأناضول": "🇹🇷",
-             "وكالة الأنباء السعودية (واس)": "🇸🇦", "وكالة الأنباء الإماراتية (وام)": "🇦🇪",
-             "الجزيرة مباشر": "🇶🇦", "TRT عربي": "🇹🇷", "الميادين": "🇱🇧", "صحيفة القدس": "🇵🇸",
-             "الحدث": "🇸🇦", "المشهد": "🇪🇬", "إرم نيوز": "🇸🇩", "عربي 21": "🇬🇧",
-             "المصري اليوم": "🇪🇬", "القدس العربي": "🇬🇧", "الشرق الأوسط": "🇬🇧",
-             "البيان": "🇦🇪", "الشرق": "🇶🇦"}
-    flag = flags.get(news["source"], "🌐")
-    
-    if urg == "عاجل":
-        header = f"🚨{flag} #عاجل {news['source']}:"
-    elif urg == "مهم":
-        header = f"📌{flag} {news['source']}:"
-    else:
-        header = f"📰{flag} {news['source']}:"
+FLAGS = {
+    "الجزيرة": "🇶🇦", "BBC عربي": "🇬🇧", "CNN": "🇺🇸", "روسيا اليوم": "🇷🇺", "سكاي نيوز": "🇦🇪",
+    "فرانس 24": "🇫🇷", "العربية": "🇸🇦", "الشرق للأخبار": "🇶🇦", "الغد": "🇯🇴", "المصدر": "🇾🇪",
+    "الخليج": "🇦🇪", "وكالة الأناضول": "🇹🇷", "TRT عربي": "🇹🇷", "الميادين": "🇱🇧",
+    "صحيفة القدس": "🇵🇸", "الحدث": "🇸🇦", "المشهد": "🇪🇬", "إرم نيوز": "🇸🇩",
+    "عربي 21": "🇬🇧", "المصري اليوم": "🇪🇬", "القدس العربي": "🇬🇧", "الشرق الأوسط": "🇬🇧",
+    "البيان": "🇦🇪", "الشرق": "🇶🇦", "الرأي": "🇰🇼", "وكالة الأنباء السعودية (واس)": "🇸🇦",
+    "وكالة الأنباء الإماراتية (وام)": "🇦🇪", "الجزيرة مباشر": "🇶🇦"
+}
 
-    text = f"""{header}
+def fmt(news, imp, sm, impact, urg):
+    flag = FLAGS.get(news["source"], "🌐")
+    if urg == "عاجل":
+        hdr = f"🚨{flag} #عاجل {news['source']}:"
+    elif urg == "مهم":
+        hdr = f"📌{flag} {news['source']}:"
+    else:
+        hdr = f"📰{flag} {news['source']}:"
+    return f"""{hdr}
 {news['title']}
 
 {sm[:200]}
-
-{"💡 " + impact[:150] if impact else ""}
 🔗 [المصدر]({news['link']})"""
-    return text
 
-# ========== مهمة ==========
+# ========== مهمة النشر مع الرد على آخر خبر ==========
 async def job(context):
-    print("🔄 جاري جلب الأخبار من 28 مصدر...")
+    print("🔄 جلب الأخبار...")
     all_news = fetch_all()
     if not all_news:
-        print("لا توجد أخبار جديدة")
+        print("لا أخبار جديدة")
         return
 
-    urgent = []; important = []; normal = []
+    urgent, important, normal = [], [], []
     for n in all_news:
-        imp, sm, impact, urg = analyze(n["title"], n["summary"])
+        imp, sm, impact, urg = classify(n["title"], n["summary"])
         if urg == "عاجل":
             urgent.append((n, imp, sm, impact, urg))
         elif urg == "مهم" or imp >= 7:
@@ -178,41 +159,57 @@ async def job(context):
         else:
             normal.append((n, imp, sm, impact, urg))
 
-    to_publish = urgent + important[:3] + normal[:2]
-    random.shuffle(to_publish)
+    to_pub = urgent + important[:3] + normal[:2]
+    random.shuffle(to_pub)
 
-    count = 0
-    for item in to_publish:
+    # جلب آخر رسالة في القناة
+    try:
+        # إزالة @ من اسم القناة إذا وجد
+        chat_id = CHANNEL.replace("@", "")
+        updates = await context.bot.get_updates(offset=-1, limit=1)
+        last_msg_id = None
+        if updates:
+            last_msg_id = updates[-1].message.message_id
+    except:
+        last_msg_id = None
+
+    cnt = 0
+    for item in to_pub:
         n, imp, sm, impact, urg = item
         try:
             txt = fmt(n, imp, sm, impact, urg)
-            # زر التعليق
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("💬 علّق", url=n['link'])]
-            ])
-            await context.bot.send_message(
+            # نشر كرسالة جديدة
+            msg = await context.bot.send_message(
                 CHANNEL,
                 txt,
                 parse_mode="Markdown",
-                disable_web_page_preview=True,
-                reply_markup=keyboard
+                disable_web_page_preview=True
             )
-            count += 1
+            
+            # بعد 5 ثوان، رد على نفس الرسالة بتحليل بسيط
+            await asyncio.sleep(5)
+            await context.bot.send_message(
+                CHANNEL,
+                f"💡 تحليل سريع: {n['summary'][:150]}...",
+                reply_to_message_id=msg.message_id
+            )
+            
+            cnt += 1
             print(f"✅ {n['source']}: {n['title'][:50]}")
+            await asyncio.sleep(2)
         except Exception as e:
             print(f"❌ {e}")
 
-    print(f"📢 تم نشر {count} خبر")
+    print(f"📢 {cnt} خبر")
 
 # ========== بدء ==========
 def main():
     if not BOT_TOKEN or not CHANNEL:
-        print("❌ خطأ: المتغيرات غير موجودة")
+        print("❌ المتغيرات ناقصة")
         return
-
     app = Application.builder().token(BOT_TOKEN).build()
-    app.job_queue.run_repeating(job, interval=900, first=15)
-    print("🚀 Bot started with 28 sources + Gemini AI + Comments...")
+    app.job_queue.run_repeating(job, interval=600, first=10)
+    print("🚀 Bot started (رد تلقائي على كل خبر)...")
     app.run_polling()
 
 if __name__ == "__main__":
